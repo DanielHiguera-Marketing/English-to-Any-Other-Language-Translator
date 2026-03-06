@@ -67,6 +67,16 @@ with st.sidebar:
         type="password",
         help="Only needed if you enable SEMrush keyword analysis.",
     )
+    is_local = os.path.isdir(os.path.expanduser("~/Desktop"))
+    if is_local:
+        st.divider()
+        output_dir = st.text_input(
+            "Output directory",
+            value=str(DEFAULT_OUTPUT),
+            help="Where .xlsx files are also saved locally.",
+        )
+    else:
+        output_dir = None
 
 # ---------------------------------------------------------------------------
 # Main UI
@@ -168,6 +178,10 @@ if enable_semrush and not semrush_key:
 
 if st.button("Start Translation", disabled=not can_run, type="primary"):
     out_path = Path(tempfile.mkdtemp())
+    local_path = None
+    if output_dir:
+        local_path = Path(output_dir)
+        local_path.mkdir(parents=True, exist_ok=True)
     client = anthropic.Anthropic(api_key=anthropic_key)
 
     progress_bar = st.progress(0)
@@ -234,12 +248,17 @@ if st.button("Start Translation", disabled=not can_run, type="primary"):
             status.markdown(f"**[{page_num}/{total}]** Fetching SEMrush keywords ...")
             semrush_keywords = fetch_semrush_keywords(semrush_key, url, target_lang)
 
-        # Write Excel
+        # Write Excel (temp dir for downloads)
         file_path = get_safe_path(out_path, page_data["page_name"], target_lang)
         try:
             write_xlsx(file_path, page_data, content_translations,
                        image_translations, seo_translations, semrush_keywords)
             completed_files.append(file_path)
+            # Also save locally if running on localhost
+            if local_path:
+                local_file = get_safe_path(local_path, page_data["page_name"], target_lang)
+                import shutil
+                shutil.copy2(file_path, local_file)
         except Exception as e:
             st.error(f"Failed to write Excel: {e}")
 
@@ -251,7 +270,10 @@ if st.button("Start Translation", disabled=not can_run, type="primary"):
 
     if completed_files:
         st.balloons()
-        st.success(f"Done! {len(completed_files)} file(s) saved to `{output_dir}`")
+        if local_path:
+            st.success(f"Done! {len(completed_files)} file(s) saved to `{local_path}`")
+        else:
+            st.success(f"Done! {len(completed_files)} file(s) ready to download.")
         for f in completed_files:
             st.markdown(f"- `{f.name}`")
 
