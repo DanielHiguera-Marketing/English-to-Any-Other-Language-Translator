@@ -4,9 +4,11 @@ Paperturn Translation App
 Streamlit front-end for the batch translation script.
 """
 
+import io
 import os
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 import streamlit as st
@@ -270,20 +272,49 @@ if st.button("Start Translation", disabled=not can_run, type="primary"):
 
     if completed_files:
         st.balloons()
-        if local_path:
-            st.success(f"Done! {len(completed_files)} file(s) saved to `{local_path}`")
-        else:
-            st.success(f"Done! {len(completed_files)} file(s) ready to download.")
+        # Store files in session state so download buttons persist
+        file_data = []
         for f in completed_files:
-            st.markdown(f"- `{f.name}`")
-
-            # Offer download
             with open(f, "rb") as fh:
-                st.download_button(
-                    label=f"Download {f.name}",
-                    data=fh.read(),
-                    file_name=f.name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                file_data.append({"name": f.name, "data": fh.read()})
+        st.session_state["completed_files"] = file_data
+        if local_path:
+            st.session_state["local_path"] = str(local_path)
     else:
         st.error("No files were generated. Check the errors above.")
+
+# Show download buttons from session state (persists across reruns)
+if "completed_files" in st.session_state and st.session_state["completed_files"]:
+    files = st.session_state["completed_files"]
+    local = st.session_state.get("local_path")
+
+    st.divider()
+    if local:
+        st.success(f"**{len(files)} file(s)** saved to `{local}` and ready to download.")
+    else:
+        st.success(f"**{len(files)} file(s)** ready to download.")
+
+    # Download All as zip (if more than one file)
+    if len(files) > 1:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                zf.writestr(f["name"], f["data"])
+        zip_buffer.seek(0)
+        st.download_button(
+            label=f"Download All ({len(files)} files as .zip)",
+            data=zip_buffer.getvalue(),
+            file_name=f"translations-{target_lang.lower()}.zip",
+            mime="application/zip",
+            key="download_all",
+        )
+
+    # Individual download buttons
+    for i, f in enumerate(files):
+        st.download_button(
+            label=f"Download {f['name']}",
+            data=f["data"],
+            file_name=f["name"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"download_{i}",
+        )
