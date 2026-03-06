@@ -5,6 +5,7 @@ Streamlit front-end for the batch translation script.
 """
 
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -65,12 +66,6 @@ with st.sidebar:
         value=os.environ.get("SEMRUSH_API_KEY", ""),
         type="password",
         help="Only needed if you enable SEMrush keyword analysis.",
-    )
-    st.divider()
-    output_dir = st.text_input(
-        "Output directory",
-        value=str(DEFAULT_OUTPUT),
-        help="Where .xlsx files are saved.",
     )
 
 # ---------------------------------------------------------------------------
@@ -172,8 +167,7 @@ if enable_semrush and not semrush_key:
     st.warning("Enter your SEMrush API key in the sidebar, or disable SEMrush.")
 
 if st.button("Start Translation", disabled=not can_run, type="primary"):
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    out_path = Path(tempfile.mkdtemp())
     client = anthropic.Anthropic(api_key=anthropic_key)
 
     progress_bar = st.progress(0)
