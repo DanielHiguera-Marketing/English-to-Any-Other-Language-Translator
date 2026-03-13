@@ -468,52 +468,108 @@ def translate_seo(client: anthropic.Anthropic, seo: dict,
 # ---------------------------------------------------------------------------
 # SEMrush Integration (optional)
 # ---------------------------------------------------------------------------
-def fetch_semrush_keywords(api_key: str, url: str, lang: str) -> list:
-    """Fetch keyword recommendations from SEMrush API."""
-    # Map language names to SEMrush database codes
+def extract_seed_keywords(client: anthropic.Anthropic, content_items: list, lang: str) -> list:
+    """Use Claude to extract seed keywords from page content, translated into target language."""
+    # Build a summary of the page content
+    page_text = "\n".join(f"{tag}: {text}" for tag, text in content_items[:15])
+
+    response = call_claude(
+        client,
+        f"You are an SEO keyword research expert fluent in {lang}.",
+        f"Based on this page content, generate 8 short seed keywords in {lang} (1-2 words each) "
+        f"that someone searching for this type of product/service would use. "
+        f"Keep them broad enough to have search volume. "
+        f"Return ONLY the keywords, one per line, no numbers or bullets. "
+        f"Keywords must be in {lang}.\n\n{page_text}",
+    )
+    keywords = [line.strip() for line in response.strip().split("\n") if line.strip()]
+    return keywords[:8]
+
+
+def fetch_semrush_keywords(api_key: str, url: str, lang: str,
+                           client: anthropic.Anthropic = None,
+                           content_items: list = None) -> list:
+    """Fetch keyword recommendations from SEMrush API using seed keywords from the page."""
     lang_db_map = {
         "spanish": "es", "french": "fr", "german": "de",
         "danish": "dk", "swedish": "se", "italian": "it",
         "portuguese": "br", "dutch": "nl",
     }
     db = lang_db_map.get(lang.lower(), "us")
-    domain = urlparse(url).netloc
 
-    try:
-        # Get organic keywords for the domain in target market
-        api_url = (
-            f"https://api.semrush.com/"
-            f"?type=url_organic"
-            f"&key={api_key}"
-            f"&url={url}"
-            f"&database={db}"
-            f"&display_limit=20"
-            f"&export_columns=Ph,Po,Nq,Cp"
+    # Step 1: Extract seed keywords using Claude
+    seed_keywords = []
+    if client and content_items:
+        print(f"    Extracting seed keywords for {lang} ...")
+        seed_keywords = extract_seed_keywords(client, content_items, lang)
+        print(f"    Seed keywords: {seed_keywords}")
+
+    if not seed_keywords:
+        # Fallback: use URL path words
+        path = urlparse(url).path.replace("/", " ").replace("-", " ").strip()
+        seed_keywords = [path] if path else ["flipbook"]
+
+    # Step 2: Query SEMrush for each seed keyword
+    all_keywords = {}
+    for seed in seed_keywords:
+        for query_type in ["phrase_related", "phrase_this"]:
+            try:
+                api_url = (
+                    f"https://api.semrush.com/"
+                    f"?type={query_type}"
+                    f"&key={api_key}"
+                    f"&phrase={requests.utils.quote(seed)}"
+                    f"&database={db}"
+                    f"&display_limit=10"
+                    f"&export_columns=Ph,Nq,Cp,Co"
+                )
+                resp = requests.get(api_url, timeout=30)
+                if resp.status_code == 200 and not resp.text.strip().startswith("ERROR"):
+                    reader = csv.reader(resp.text.strip().split("\n"), delimiter=";")
+                    next(reader, None)  # Skip header
+                    for row in reader:
+                        if len(row) >= 2:
+                            kw = row[0]
+                            vol = row[1] if len(row) > 1 else "0"
+                            cpc = row[2] if len(row) > 2 else "0"
+                            comp = row[3] if len(row) > 3 else "0"
+                            # Deduplicate, keep highest volume
+                            if kw not in all_keywords or int(vol) > int(all_keywords[kw].get("volume", "0") or "0"):
+                                all_keywords[kw] = {
+                                    "keyword": kw,
+                                    "volume": vol,
+                                    "cpc": cpc,
+                                    "competition": comp,
+                                    "seed": seed,
+                                }
+            except Exception as e:
+                print(f"    SEMrush error for '{seed}' ({query_type}): {e}")
+
+    # Sort by search volume descending
+    results = sorted(all_keywords.values(), key=lambda x: int(x.get("volume", "0") or "0"), reverse=True)
+    print(f"    SEMrush raw total: {len(results)} unique keywords")
+
+    # Filter with Claude to keep only relevant keywords
+    if client and content_items and results:
+        top_candidates = results[:50]
+        kw_list = "\n".join(f"- {kw['keyword']} (vol: {kw['volume']})" for kw in top_candidates)
+        page_summary = " ".join(text for _, text in content_items[:5])
+
+        filter_response = call_claude(
+            client,
+            "You are an SEO expert. Filter keyword lists for relevance.",
+            f"This page is about: {page_summary[:300]}\n\n"
+            f"From this keyword list, return ONLY the keywords that are directly relevant "
+            f"to digital catalogs, flipbooks, PDF publishing, product catalogs, or industrial/manufacturing "
+            f"content management. Remove brand names, locations, and unrelated terms. "
+            f"Return one keyword per line, nothing else.\n\n{kw_list}",
         )
-        resp = requests.get(api_url, timeout=30)
-        print(f"    SEMrush status: {resp.status_code}")
-        print(f"    SEMrush response (first 500 chars): {resp.text[:500]}")
-        if resp.status_code == 200 and resp.text.strip():
-            # Check if response is an error message
-            if resp.text.strip().startswith("ERROR"):
-                print(f"    SEMrush API error: {resp.text.strip()}")
-                return []
-            keywords = []
-            reader = csv.reader(resp.text.strip().split("\n"), delimiter=";")
-            next(reader, None)  # Skip header
-            for row in reader:
-                if len(row) >= 2:
-                    keywords.append({"keyword": row[0], "position": row[1],
-                                     "volume": row[2] if len(row) > 2 else "",
-                                     "cpc": row[3] if len(row) > 3 else ""})
-            print(f"    SEMrush parsed {len(keywords)} keywords")
-            return keywords
-        else:
-            print(f"    SEMrush returned status {resp.status_code}, body: {resp.text[:200]}")
-            return []
-    except Exception as e:
-        print(f"    SEMrush error: {e}")
-        return []
+        relevant = {line.strip().lstrip("- ").lower() for line in filter_response.strip().split("\n") if line.strip()}
+        filtered = [kw for kw in top_candidates if kw["keyword"].lower() in relevant]
+        print(f"    SEMrush filtered: {len(filtered)} relevant keywords")
+        return filtered[:30]
+
+    return results[:30]
 
 
 # ---------------------------------------------------------------------------
@@ -593,19 +649,29 @@ def write_xlsx(output_path: Path, page_data: dict, content_translations: tuple,
         final_text = seo_final[i][1] if i < len(seo_final) else ""
         ws_seo.append([field, english, trans_text, final_text])
 
-    # SEMrush keywords row
+    # SEMrush keywords section
     if semrush_keywords:
-        kw_str = ", ".join(
-            f"{kw['keyword']} (vol:{kw['volume']}, pos:{kw['position']})"
-            for kw in semrush_keywords
-        )
-        ws_seo.append(["SEMrush Keywords", "—", kw_str, "—"])
+        ws_seo.append([])  # blank row
+        ws_seo.append(["SEMrush Keywords", "Volume", "CPC", "Competition"])
+        # Style the keyword header row
+        kw_header_row = ws_seo.max_row
+        for col in range(1, 5):
+            cell = ws_seo.cell(row=kw_header_row, column=col)
+            cell.font = HEADER_FONT_WHITE
+            cell.fill = HEADER_FILL
+        for kw in semrush_keywords:
+            ws_seo.append([
+                kw.get("keyword", ""),
+                kw.get("volume", ""),
+                kw.get("cpc", ""),
+                kw.get("competition", ""),
+            ])
     else:
         ws_seo.append(["SEMrush Keywords", "—", "—", "—"])
 
     for col_letter in ["A", "B", "C", "D"]:
         ws_seo.column_dimensions[col_letter].width = 45
-    ws_seo.column_dimensions["A"].width = 20
+    ws_seo.column_dimensions["A"].width = 30
 
     # Save
     wb.save(output_path)
@@ -738,7 +804,10 @@ Examples:
             confirm = input(f"\n  Run SEMrush analysis for {url}? [y/N]: ").strip().lower()
             if confirm == "y":
                 print(f"    Fetching SEMrush keywords ...")
-                semrush_keywords = fetch_semrush_keywords(semrush_key, url, args.lang)
+                semrush_keywords = fetch_semrush_keywords(
+                    semrush_key, url, args.lang,
+                    client=client, content_items=page_data["content"],
+                )
                 print(f"    Found {len(semrush_keywords)} keywords")
 
         # 7. Write Excel

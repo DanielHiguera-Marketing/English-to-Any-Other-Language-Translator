@@ -248,7 +248,10 @@ if st.button("Start Translation", disabled=not can_run, type="primary"):
         semrush_keywords = []
         if enable_semrush and semrush_key and url in semrush_urls:
             status.markdown(f"**[{page_num}/{total}]** Fetching SEMrush keywords ...")
-            semrush_keywords = fetch_semrush_keywords(semrush_key, url, target_lang)
+            semrush_keywords = fetch_semrush_keywords(
+                semrush_key, url, target_lang,
+                client=client, content_items=page_data["content"],
+            )
             if semrush_keywords:
                 st.info(f"SEMrush: Found {len(semrush_keywords)} keywords for {url}")
             else:
