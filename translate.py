@@ -383,10 +383,25 @@ def parse_api_response(response: str, expected_tags: list) -> list:
     return results
 
 
+SEO_REWRITE_SYSTEM = (
+    "You are a world-class SEO copywriter and native {lang} speaker. "
+    "You have been given marketing copy and a list of target SEO keywords. "
+    "Your job is to naturally weave the most relevant keywords into the copy "
+    "where they fit organically. Do NOT force keywords in — only use them where "
+    "they sound natural. Prioritize higher-volume keywords. "
+    "Do not change the meaning or tone of the copy. "
+    "CRITICAL: Keep the labels/tags in English exactly as they appear. "
+    "Only modify the text AFTER the colon. "
+    "IMPORTANT: Use a maximum of 1 em dash (—) across ALL the copy combined. "
+    "Return the result in the exact same structured format, one item per line."
+)
+
+
 def translate_content(client: anthropic.Anthropic, content_items: list,
                       translator_prompt: str, copywriter_prompt: str,
-                      lang: str, char_limit_pct: int = None) -> tuple:
-    """Two-step translate + copywrite pipeline. Returns (translations, final_copies)."""
+                      lang: str, char_limit_pct: int = None,
+                      seo_keywords: list = None) -> tuple:
+    """Two or three-step pipeline. Returns (translations, final_copies)."""
     if not content_items:
         return [], []
 
@@ -400,13 +415,27 @@ def translate_content(client: anthropic.Anthropic, content_items: list,
 
     # Step 2: Copywrite (fresh call)
     print(f"    Copywriting content ...")
-    cw_prompt = copywriter_prompt
     user_msg = translation_raw
     if char_limit_pct is not None:
         char_instructions = build_char_limit_instruction(content_items, char_limit_pct)
         user_msg = f"{translation_raw}\n\n{char_instructions}"
-    final_raw = call_claude(client, cw_prompt, user_msg)
+    final_raw = call_claude(client, copywriter_prompt, user_msg)
     final_copies = parse_api_response(final_raw, expected_tags)
+
+    # Step 3: SEO keyword integration (fresh call, only if keywords provided)
+    if seo_keywords:
+        print(f"    SEO rewrite with {len(seo_keywords)} keywords ...")
+        kw_list = "\n".join(
+            f"- {kw['keyword']} (volume: {kw['volume']})"
+            for kw in seo_keywords
+        )
+        seo_prompt = SEO_REWRITE_SYSTEM.format(lang=lang)
+        seo_user_msg = f"{final_raw}\n\nTARGET SEO KEYWORDS (prioritize higher volume):\n{kw_list}"
+        if char_limit_pct is not None:
+            char_instructions = build_char_limit_instruction(content_items, char_limit_pct)
+            seo_user_msg = f"{seo_user_msg}\n\n{char_instructions}"
+        seo_raw = call_claude(client, seo_prompt, seo_user_msg)
+        final_copies = parse_api_response(seo_raw, expected_tags)
 
     return translations, final_copies
 
@@ -759,7 +788,19 @@ Examples:
         # 2. Get system prompts for this page (fresh per page)
         prompts = get_system_prompts(args.lang)
 
-        # 3. Content translation + copywriting
+        # 3. SEMrush (run first so keywords feed into content rewrite)
+        semrush_keywords = []
+        if args.semrush and semrush_key:
+            confirm = input(f"\n  Run SEMrush analysis for {url}? [y/N]: ").strip().lower()
+            if confirm == "y":
+                print(f"    Fetching SEMrush keywords ...")
+                semrush_keywords = fetch_semrush_keywords(
+                    semrush_key, url, args.lang,
+                    client=client, content_items=page_data["content"],
+                )
+                print(f"    Found {len(semrush_keywords)} keywords")
+
+        # 4. Content translation + copywriting + SEO rewrite
         try:
             content_translations = translate_content(
                 client, page_data["content"],
@@ -767,12 +808,13 @@ Examples:
                 prompts["copywriter"],
                 args.lang,
                 char_limit_pct=args.char_limit,
+                seo_keywords=semrush_keywords if semrush_keywords else None,
             )
         except Exception as e:
             print(f"  Error translating content: {e}")
             content_translations = ([], [])
 
-        # 4. Image alt text translation + copywriting
+        # 5. Image alt text translation + copywriting
         try:
             image_translations = translate_images(
                 client, page_data["images"],
@@ -785,7 +827,7 @@ Examples:
             print(f"  Error translating images: {e}")
             image_translations = ([], [])
 
-        # 5. SEO translation + copywriting
+        # 6. SEO translation + copywriting
         try:
             seo_translations = translate_seo(
                 client, page_data["seo"],
@@ -797,18 +839,6 @@ Examples:
         except Exception as e:
             print(f"  Error translating SEO: {e}")
             seo_translations = ([], [])
-
-        # 6. SEMrush (optional, gated)
-        semrush_keywords = []
-        if args.semrush and semrush_key:
-            confirm = input(f"\n  Run SEMrush analysis for {url}? [y/N]: ").strip().lower()
-            if confirm == "y":
-                print(f"    Fetching SEMrush keywords ...")
-                semrush_keywords = fetch_semrush_keywords(
-                    semrush_key, url, args.lang,
-                    client=client, content_items=page_data["content"],
-                )
-                print(f"    Found {len(semrush_keywords)} keywords")
 
         # 7. Write Excel
         file_path = get_safe_path(output_dir, page_data["page_name"], args.lang)
