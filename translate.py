@@ -491,7 +491,13 @@ def fetch_semrush_keywords(api_key: str, url: str, lang: str) -> list:
             f"&export_columns=Ph,Po,Nq,Cp"
         )
         resp = requests.get(api_url, timeout=30)
+        print(f"    SEMrush status: {resp.status_code}")
+        print(f"    SEMrush response (first 500 chars): {resp.text[:500]}")
         if resp.status_code == 200 and resp.text.strip():
+            # Check if response is an error message
+            if resp.text.strip().startswith("ERROR"):
+                print(f"    SEMrush API error: {resp.text.strip()}")
+                return []
             keywords = []
             reader = csv.reader(resp.text.strip().split("\n"), delimiter=";")
             next(reader, None)  # Skip header
@@ -500,9 +506,10 @@ def fetch_semrush_keywords(api_key: str, url: str, lang: str) -> list:
                     keywords.append({"keyword": row[0], "position": row[1],
                                      "volume": row[2] if len(row) > 2 else "",
                                      "cpc": row[3] if len(row) > 3 else ""})
+            print(f"    SEMrush parsed {len(keywords)} keywords")
             return keywords
         else:
-            print(f"    SEMrush returned status {resp.status_code}")
+            print(f"    SEMrush returned status {resp.status_code}, body: {resp.text[:200]}")
             return []
     except Exception as e:
         print(f"    SEMrush error: {e}")
