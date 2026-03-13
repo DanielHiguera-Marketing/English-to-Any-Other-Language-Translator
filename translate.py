@@ -423,6 +423,7 @@ def translate_content(client: anthropic.Anthropic, content_items: list,
     final_copies = parse_api_response(final_raw, expected_tags)
 
     # Step 3: SEO keyword integration (fresh call, only if keywords provided)
+    seo_copies = []
     if seo_keywords:
         print(f"    SEO rewrite with {len(seo_keywords)} keywords ...")
         kw_list = "\n".join(
@@ -435,9 +436,9 @@ def translate_content(client: anthropic.Anthropic, content_items: list,
             char_instructions = build_char_limit_instruction(content_items, char_limit_pct)
             seo_user_msg = f"{seo_user_msg}\n\n{char_instructions}"
         seo_raw = call_claude(client, seo_prompt, seo_user_msg)
-        final_copies = parse_api_response(seo_raw, expected_tags)
+        seo_copies = parse_api_response(seo_raw, expected_tags)
 
-    return translations, final_copies
+    return translations, final_copies, seo_copies
 
 
 def translate_images(client: anthropic.Anthropic, images: list,
@@ -628,20 +629,30 @@ def write_xlsx(output_path: Path, page_data: dict, content_translations: tuple,
     # --- Sheet 1: Content ---
     ws_content = wb.active
     ws_content.title = "Content"
-    ws_content.append(["Text Tag", "English", "Translation", "Final Copy"])
-    style_header(ws_content, 4)
-
     content_items = page_data["content"]
-    translations, final_copies = content_translations
+    translations, final_copies, seo_copies = content_translations
+
+    has_seo_col = bool(seo_copies)
+    if has_seo_col:
+        ws_content.append(["Text Tag", "English", "Translation", "Final Copy", "SEO Copy"])
+        style_header(ws_content, 5)
+    else:
+        ws_content.append(["Text Tag", "English", "Translation", "Final Copy"])
+        style_header(ws_content, 4)
 
     for i, (tag, english) in enumerate(content_items):
         trans_text = translations[i][1] if i < len(translations) else ""
         final_text = final_copies[i][1] if i < len(final_copies) else ""
-        ws_content.append([tag, english, trans_text, final_text])
+        row = [tag, english, trans_text, final_text]
+        if has_seo_col:
+            seo_text = seo_copies[i][1] if i < len(seo_copies) else ""
+            row.append(seo_text)
+        ws_content.append(row)
 
     # Auto-width columns
-    for col_letter in ["A", "B", "C", "D"]:
-        ws_content.column_dimensions[col_letter].width = 40
+    for col_letter in ["A", "B", "C", "D", "E"]:
+        if col_letter in ws_content.column_dimensions:
+            ws_content.column_dimensions[col_letter].width = 40
     ws_content.column_dimensions["A"].width = 18
 
     # --- Sheet 2: Images ---
@@ -812,7 +823,7 @@ Examples:
             )
         except Exception as e:
             print(f"  Error translating content: {e}")
-            content_translations = ([], [])
+            content_translations = ([], [], [])
 
         # 5. Image alt text translation + copywriting
         try:

@@ -232,7 +232,7 @@ if st.button("Start Translation", disabled=not can_run, type="primary"):
             )
         except Exception as e:
             st.error(f"Content translation failed: {e}")
-            content_translations = ([], [])
+            content_translations = ([], [], [])
 
         # Images
         try:
