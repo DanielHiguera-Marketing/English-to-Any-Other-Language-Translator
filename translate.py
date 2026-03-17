@@ -155,7 +155,8 @@ def scrape_page(url: str) -> dict:
     if not main:
         main = soup
 
-    # Walk the DOM in order to capture everything in page sequence
+    # Walk section_content divs in DOM order — these are Paperturn's CMS content blocks.
+    # Each contains a mix of headings, paragraphs, bare text nodes, images, and links.
     from bs4 import NavigableString
 
     tag_map = {
@@ -164,75 +165,131 @@ def scrape_page(url: str) -> dict:
     }
     cta_keywords = {"trial", "demo", "start", "book", "contact", "sign up", "get started", "free"}
     cta_hrefs = {"free-trial", "demo", "sign-up", "contact", "book-a-demo", "get-started"}
-    trust_keywords = {"credit card", "cancel anytime", "trusted by", "no commitment",
-                      "free trial", "in-trial support", "guarantee", "money back",
-                      "organizations worldwide", "businesses"}
+    # Trust signals are very specific phrases — match the full line, not substrings
+    trust_phrases = {
+        "dedicated in-trial support", "no credit card required", "cancel anytime",
+        "trusted by", "organizations worldwide", "businesses worldwide",
+        "no commitment", "money back guarantee", "14-day free trial",
+    }
 
     seen_texts = set()
 
-    for element in main.descendants:
-        # --- Bare text nodes (trust signals like "Dedicated In-Trial Support ...") ---
-        if isinstance(element, NavigableString):
-            text = element.strip()
-            if not text or len(text) < 15 or len(text) > 200:
+    def _is_trust_signal(text: str) -> bool:
+        """Check if text is a known trust signal line."""
+        lower = text.lower()
+        return any(phrase in lower for phrase in trust_phrases)
+
+    def _is_testimonial_attribution(text: str) -> bool:
+        """Check if text looks like a name/job title attribution."""
+        if len(text) < 5 or len(text) > 150:
+            return False
+        # Must be relatively short (job titles, not paragraphs)
+        if len(text) > 80:
+            return False
+        # Use word-boundary matching to avoid false positives like "Leads"
+        job_patterns = [
+            r'\bmanager\b', r'\bdirector\b', r'\bpresident\b', r'\bceo\b',
+            r'\bcfo\b', r'\bcoo\b', r'\bcoordinator\b', r'\bspecialist\b',
+            r'\bofficer\b', r'\bhead of\b', r'\bvp\b', r'\bvice president\b',
+            r'\bfounder\b', r'\beditor\b', r'\blead\b', r'\bchief\b',
+        ]
+        lower = text.lower()
+        return any(re.search(pat, lower) for pat in job_patterns)
+
+    def _add_item(tag_label: str, text: str):
+        """Add a content item if not a duplicate."""
+        if text and text not in seen_texts and len(text) > 1:
+            seen_texts.add(text)
+            content_items.append((tag_label, text))
+
+    def _process_section(container):
+        """Process a section_content div, extracting items in DOM order."""
+        for child in container.children:
+            # Bare text nodes (descriptions after H3s, attributions, trust signals)
+            if isinstance(child, NavigableString):
+                text = child.strip()
+                if not text or len(text) < 5:
+                    continue
+                if text in seen_texts:
+                    continue
+                if _is_trust_signal(text):
+                    _add_item("Trust Signal", text)
+                elif _is_testimonial_attribution(text):
+                    _add_item("Attribution", text)
+                elif len(text) >= 15:
+                    _add_item("P", text)
                 continue
-            if text in seen_texts:
+
+            if not hasattr(child, "name") or not child.name:
                 continue
-            if any(kw in text.lower() for kw in trust_keywords):
-                seen_texts.add(text)
-                content_items.append(("Trust Signal", text))
-            continue
 
-        if not hasattr(element, "name"):
-            continue
+            text = child.get_text(strip=True)
+            if not text or len(text) <= 1:
+                continue
 
-        text = element.get_text(strip=True)
-        if not text or len(text) <= 1:
-            continue
+            # Headings and paragraphs
+            if child.name in tag_map:
+                tag_label = tag_map[child.name]
+                if tag_label == "P" and len(text) < 5:
+                    continue
+                # Skip P tags that only contain CTA links
+                if tag_label == "P":
+                    child_links = child.find_all("a")
+                    link_text = "".join(a.get_text(strip=True) for a in child_links)
+                    if link_text and link_text == text:
+                        continue
+                _add_item(tag_label, text)
 
-        # --- Headings and paragraphs ---
-        if element.name in tag_map:
+            # CTA buttons / links
+            elif child.name in ("button", "a"):
+                if len(text) >= 100:
+                    continue
+                classes = " ".join(child.get("class", []))
+                href = child.get("href", "")
+                is_cta = (
+                    child.name == "button"
+                    or "btn" in classes.lower()
+                    or "cta" in classes.lower()
+                    or any(kw in text.lower() for kw in cta_keywords)
+                    or any(kw in href.lower() for kw in cta_hrefs)
+                )
+                if is_cta:
+                    _add_item("CTA Button", text)
+
+            # Nested div or span or font — recurse for bare text inside
+            elif child.name in ("div", "span", "font", "small", "figcaption", "li", "blockquote"):
+                _process_section(child)
+
+    # First pass: walk all section_content divs in DOM order
+    for section in main.find_all("div", class_=re.compile(r"section_content")):
+        _process_section(section)
+
+    # Fallback: if we found very little, do a broad pass (non-CMS pages)
+    if len(content_items) < 5:
+        for element in main.find_all(list(tag_map.keys())):
+            text = element.get_text(strip=True)
+            if not text or len(text) <= 1:
+                continue
             tag_label = tag_map[element.name]
             if tag_label == "P" and len(text) < 5:
                 continue
-            # Skip P tags that only contain CTA links
-            if tag_label == "P":
-                child_links = element.find_all("a")
-                link_text = "".join(a.get_text(strip=True) for a in child_links)
-                if link_text and link_text == text:
-                    continue
-            if text not in seen_texts:
-                seen_texts.add(text)
-                content_items.append((tag_label, text))
+            _add_item(tag_label, text)
 
-        # --- CTA buttons / links ---
-        elif element.name in ("button", "a"):
-            if len(text) >= 100:
+        for btn in main.find_all(["button", "a"]):
+            text = btn.get_text(strip=True)
+            if not text or len(text) <= 1 or len(text) >= 100:
                 continue
-            classes = " ".join(element.get("class", []))
-            href = element.get("href", "")
+            classes = " ".join(btn.get("class", []))
+            href = btn.get("href", "")
             is_cta = (
-                element.name == "button"
+                btn.name == "button"
                 or "btn" in classes.lower()
                 or "cta" in classes.lower()
                 or any(kw in text.lower() for kw in cta_keywords)
                 or any(kw in href.lower() for kw in cta_hrefs)
             )
-            if is_cta and text not in seen_texts:
-                seen_texts.add(text)
-                content_items.append(("CTA Button", text))
-
-        # --- Trust signal divs (leaf divs with trust keywords) ---
-        elif element.name == "div":
-            if len(text) < 15 or len(text) > 200:
-                continue
-            if len(element.find_all("div")) > 1:
-                continue
-            if text in seen_texts:
-                continue
-            if any(kw in text.lower() for kw in trust_keywords):
-                seen_texts.add(text)
-                content_items.append(("Trust Signal", text))
+            if is_cta:
+                _add_item("CTA Button", text)
 
     # --- Images ---
     images = []
