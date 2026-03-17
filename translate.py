@@ -240,11 +240,15 @@ def scrape_page(url: str) -> dict:
                         continue
                 _add_item(tag_label, text)
 
-            # CTA buttons / links
+            # CTA buttons / links (skip card-style links — those are handled separately)
             elif child.name in ("button", "a"):
                 if len(text) >= 100:
                     continue
                 classes = " ".join(child.get("class", []))
+                # Skip card links — handled by dedicated card extractors
+                if any(c in classes for c in ["feature-card", "solution-card",
+                                               "fb-showcase-card", "showcase-card"]):
+                    continue
                 href = child.get("href", "")
                 is_cta = (
                     child.name == "button"
@@ -256,13 +260,93 @@ def scrape_page(url: str) -> dict:
                 if is_cta:
                     _add_item("CTA Button", text)
 
-            # Nested div or span or font — recurse for bare text inside
-            elif child.name in ("div", "span", "font", "small", "figcaption", "li", "blockquote"):
+            # Font tags used as headings (CMS pattern: <font class="h2">)
+            elif child.name == "font":
+                classes = " ".join(child.get("class", []))
+                handled = False
+                for tag_name, label in [("h1", "H1"), ("h2", "H2"), ("h3", "H3"), ("h4", "H4")]:
+                    if tag_name in classes:
+                        _add_item(label, text)
+                        handled = True
+                        break
+                if not handled:
+                    _process_section(child)
+
+            # Nested div or span — recurse for bare text inside
+            elif child.name in ("div", "span", "small", "figcaption", "li", "blockquote"):
                 _process_section(child)
+
+    # Collect all image alt texts so we can skip them if they appear as P text
+    all_alt_texts = {img.get("alt", "").strip() for img in main.find_all("img") if img.get("alt")}
+
+    def _process_card(card_el):
+        """Extract text from card-style links (feature-card, solution-card, etc.)."""
+        for child in card_el.find_all(["h3", "h4", "h5"]):
+            text = child.get_text(strip=True)
+            if text:
+                _add_item(tag_map.get(child.name, "H4"), text)
+        for child in card_el.find_all("p"):
+            text = child.get_text(strip=True)
+            if text and len(text) >= 5 and text not in all_alt_texts:
+                _add_item("P", text)
 
     # First pass: walk all section_content divs in DOM order
     for section in main.find_all("div", class_=re.compile(r"section_content")):
         _process_section(section)
+
+    # Second pass: handle special elements not inside section_content divs
+
+    # Font tags used as headings (e.g., <font class="h2">)
+    for font in main.find_all("font"):
+        classes = " ".join(font.get("class", []))
+        text = font.get_text(strip=True)
+        if not text:
+            continue
+        for tag_name, label in [("h1", "H1"), ("h2", "H2"), ("h3", "H3"), ("h4", "H4")]:
+            if tag_name in classes:
+                _add_item(label, text)
+                break
+
+    # Feature cards (<a class="feature-card">)
+    for card in main.find_all("a", class_="feature-card"):
+        _process_card(card)
+
+    # Solution cards (<a class="solution-card">)
+    for card in main.find_all("a", class_="solution-card"):
+        _process_card(card)
+
+    # Flipbook showcase cards (<a class="fb-showcase-card">) — skip aria-hidden duplicates
+    for card in main.find_all("a", class_="fb-showcase-card"):
+        if card.get("aria-hidden") == "true":
+            continue
+        title_el = card.find("p", class_="fb-showcase-card-title")
+        sub_el = card.find("p", class_="fb-showcase-card-subtitle")
+        if title_el:
+            title = title_el.get_text(strip=True)
+            subtitle = sub_el.get_text(strip=True) if sub_el else ""
+            combined = f"{title} — {subtitle}" if subtitle else title
+            _add_item("Showcase", combined)
+
+    # Section description paragraphs (class="section-description") outside section_content
+    for p in main.find_all("p", class_="section-description"):
+        text = p.get_text(strip=True)
+        if text and len(text) >= 10:
+            _add_item("P", text)
+
+    # Filter out any content items that match image alt text (alt text confusion)
+    content_items_filtered = []
+    for tag, text in content_items:
+        if tag == "P" and text in all_alt_texts:
+            continue
+        # Also skip P tags that look like alt text descriptions (contain "animation showing", "image of", etc.)
+        if tag == "P" and any(phrase in text.lower() for phrase in
+                              ["animation showing", "animation demonstrating", "screenshot of",
+                               "image of", "photo of", "illustration of", "icon of",
+                               "duplicated for seamless loop", "clone of"]):
+            continue
+        content_items_filtered.append((tag, text))
+    content_items.clear()
+    content_items.extend(content_items_filtered)
 
     # Fallback: if we found very little, do a broad pass (non-CMS pages)
     if len(content_items) < 5:
@@ -272,6 +356,8 @@ def scrape_page(url: str) -> dict:
                 continue
             tag_label = tag_map[element.name]
             if tag_label == "P" and len(text) < 5:
+                continue
+            if text in all_alt_texts:
                 continue
             _add_item(tag_label, text)
 
