@@ -6,9 +6,11 @@ Streamlit front-end for the batch translation script.
 
 import io
 import os
+import shutil
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import streamlit as st
@@ -87,14 +89,18 @@ st.title("Paperturn Translator")
 st.caption("Scrape, translate, and copywrite Paperturn pages into any language.")
 
 # --- Step 1: Language ---
-st.subheader("1. Target Language")
-lang = st.selectbox(
-    "Which language are you translating into?",
+st.subheader("1. Target Language(s)")
+selected_langs = st.multiselect(
+    "Which language(s) are you translating into?",
     ["Spanish", "French", "German", "Danish", "Swedish", "Italian", "Portuguese", "Dutch"],
-    index=0,
+    default=["Spanish"],
 )
-custom_lang = st.text_input("Or type a custom language:", "")
-target_lang = custom_lang.strip() if custom_lang.strip() else lang
+custom_lang = st.text_input("Or add a custom language:", "")
+target_langs = list(selected_langs)
+if custom_lang.strip() and custom_lang.strip() not in target_langs:
+    target_langs.append(custom_lang.strip())
+# Keep backward compat for single-lang references
+target_lang = target_langs[0] if target_langs else "Spanish"
 
 # --- Step 2: URLs ---
 st.subheader("2. Pages to Translate")
@@ -172,11 +178,75 @@ with col2:
 # --- Step 4: Run ---
 st.subheader("4. Translate")
 
-can_run = bool(urls) and bool(anthropic_key)
+can_run = bool(urls) and bool(anthropic_key) and bool(target_langs)
 if not anthropic_key:
     st.warning("Enter your Anthropic API key in the sidebar to continue.")
+if not target_langs:
+    st.warning("Select at least one target language.")
 if enable_semrush and not semrush_key:
     st.warning("Enter your SEMrush API key in the sidebar, or disable SEMrush.")
+
+
+def process_page_lang(url, lang, page_data, api_key, semrush_key_val,
+                      enable_semrush_flag, semrush_urls_list, char_limit_pct_val,
+                      out_path, local_path):
+    """Process a single page + language combo. Runs in its own thread."""
+    client = anthropic.Anthropic(api_key=api_key)
+    prompts = get_system_prompts(lang)
+
+    # SEMrush
+    semrush_keywords = []
+    if enable_semrush_flag and semrush_key_val and url in semrush_urls_list:
+        semrush_keywords = fetch_semrush_keywords(
+            semrush_key_val, url, lang,
+            client=client, content_items=page_data["content"],
+        )
+
+    # Content
+    try:
+        content_translations = translate_content(
+            client, page_data["content"],
+            prompts["translator"], prompts["copywriter"],
+            lang, char_limit_pct=char_limit_pct_val,
+            seo_keywords=semrush_keywords if semrush_keywords else None,
+        )
+    except Exception as e:
+        print(f"  Content translation failed ({lang}): {e}")
+        content_translations = ([], [], [])
+
+    # Images
+    try:
+        image_translations = translate_images(
+            client, page_data["images"],
+            prompts["alt_translator"], prompts["alt_copywriter"],
+            lang, char_limit_pct=char_limit_pct_val,
+        )
+    except Exception as e:
+        print(f"  Image translation failed ({lang}): {e}")
+        image_translations = ([], [])
+
+    # SEO
+    try:
+        seo_translations = translate_seo(
+            client, page_data["seo"],
+            prompts["seo_translator"], prompts["seo_copywriter"],
+            lang, char_limit_pct=char_limit_pct_val,
+        )
+    except Exception as e:
+        print(f"  SEO translation failed ({lang}): {e}")
+        seo_translations = ([], [])
+
+    # Write Excel
+    file_path = get_safe_path(out_path, page_data["page_name"], lang)
+    write_xlsx(file_path, page_data, content_translations,
+               image_translations, seo_translations, semrush_keywords)
+
+    if local_path:
+        local_file = get_safe_path(local_path, page_data["page_name"], lang)
+        shutil.copy2(file_path, local_file)
+
+    return file_path, lang, url
+
 
 if st.button("Start Translation", disabled=not can_run, type="primary"):
     out_path = Path(tempfile.mkdtemp())
@@ -184,112 +254,70 @@ if st.button("Start Translation", disabled=not can_run, type="primary"):
     if output_dir:
         local_path = Path(output_dir)
         local_path.mkdir(parents=True, exist_ok=True)
-    client = anthropic.Anthropic(api_key=anthropic_key)
 
-    progress_bar = st.progress(0)
+    # Scrape all pages first (shared across languages)
     status = st.empty()
-    results_container = st.container()
-
-    total = len(urls)
-    completed_files = []
-
+    all_page_data = {}
     for i, url in enumerate(urls):
-        page_num = i + 1
-        status.markdown(f"**[{page_num}/{total}]** Processing: `{url}`")
-
-        # Scrape
+        status.markdown(f"**Scraping [{i+1}/{len(urls)}]** `{url}` ...")
         try:
-            status.markdown(f"**[{page_num}/{total}]** Scraping `{url}` ...")
-            page_data = scrape_page(url)
+            all_page_data[url] = scrape_page(url)
         except Exception as e:
             st.error(f"Failed to scrape {url}: {e}")
-            continue
 
-        # Get prompts
-        prompts = get_system_prompts(target_lang)
-
-        # SEMrush (run first so keywords can feed into content rewrite)
-        semrush_keywords = []
-        if enable_semrush and semrush_key and url in semrush_urls:
-            status.markdown(f"**[{page_num}/{total}]** Fetching SEMrush keywords ...")
-            semrush_keywords = fetch_semrush_keywords(
-                semrush_key, url, target_lang,
-                client=client, content_items=page_data["content"],
-            )
-            if semrush_keywords:
-                st.info(f"SEMrush: Found {len(semrush_keywords)} keywords for {url}")
-            else:
-                st.warning(f"SEMrush: No keywords returned for {url}. Check terminal for details.")
-
-        # Content (with SEO keywords if available)
-        try:
-            status.markdown(f"**[{page_num}/{total}]** Translating content ({len(page_data['content'])} items) ...")
-            content_translations = translate_content(
-                client, page_data["content"],
-                prompts["translator"], prompts["copywriter"],
-                target_lang, char_limit_pct=char_limit_pct,
-                seo_keywords=semrush_keywords if semrush_keywords else None,
-            )
-        except Exception as e:
-            st.error(f"Content translation failed: {e}")
-            content_translations = ([], [], [])
-
-        # Images
-        try:
-            status.markdown(f"**[{page_num}/{total}]** Translating {len(page_data['images'])} image alt texts ...")
-            image_translations = translate_images(
-                client, page_data["images"],
-                prompts["alt_translator"], prompts["alt_copywriter"],
-                target_lang, char_limit_pct=char_limit_pct,
-            )
-        except Exception as e:
-            st.error(f"Image translation failed: {e}")
-            image_translations = ([], [])
-
-        # SEO
-        try:
-            status.markdown(f"**[{page_num}/{total}]** Translating SEO metadata ...")
-            seo_translations = translate_seo(
-                client, page_data["seo"],
-                prompts["seo_translator"], prompts["seo_copywriter"],
-                target_lang, char_limit_pct=char_limit_pct,
-            )
-        except Exception as e:
-            st.error(f"SEO translation failed: {e}")
-            seo_translations = ([], [])
-
-        # Write Excel (temp dir for downloads)
-        file_path = get_safe_path(out_path, page_data["page_name"], target_lang)
-        try:
-            write_xlsx(file_path, page_data, content_translations,
-                       image_translations, seo_translations, semrush_keywords)
-            completed_files.append(file_path)
-            # Also save locally if running on localhost
-            if local_path:
-                local_file = get_safe_path(local_path, page_data["page_name"], target_lang)
-                import shutil
-                shutil.copy2(file_path, local_file)
-        except Exception as e:
-            st.error(f"Failed to write Excel: {e}")
-
-        progress_bar.progress(page_num / total)
-
-    # Done
-    status.empty()
-    progress_bar.empty()
-
-    if completed_files:
-        st.balloons()
-        # Store files in session state so download buttons persist
-        file_data = []
-        for f in completed_files:
-            with open(f, "rb") as fh:
-                file_data.append({"name": f.name, "data": fh.read()})
-        st.session_state["completed_files"] = file_data
-        if local_path:
-            st.session_state["local_path"] = str(local_path)
+    if not all_page_data:
+        st.error("No pages could be scraped.")
     else:
-        st.error("No files were generated. Check the errors above.")
+        # Build all jobs: (url, lang) pairs
+        jobs = [(url, lang) for url in all_page_data for lang in target_langs]
+        total_jobs = len(jobs)
+
+        status.markdown(f"**Translating {len(all_page_data)} page(s) into {len(target_langs)} language(s) "
+                        f"({total_jobs} jobs, running in parallel) ...**")
+        progress_bar = st.progress(0)
+        completed_files = []
+        errors = []
+        done_count = 0
+
+        # Run translations in parallel threads
+        max_workers = min(len(target_langs), 4)  # Cap at 4 parallel languages
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for url, lang in jobs:
+                future = executor.submit(
+                    process_page_lang,
+                    url, lang, all_page_data[url], anthropic_key,
+                    semrush_key, enable_semrush, semrush_urls, char_limit_pct,
+                    out_path, local_path,
+                )
+                futures[future] = (url, lang)
+
+            for future in as_completed(futures):
+                url, lang = futures[future]
+                done_count += 1
+                try:
+                    file_path, lang_done, url_done = future.result()
+                    completed_files.append(file_path)
+                    status.markdown(f"**[{done_count}/{total_jobs}]** Completed: `{url}` → {lang}")
+                except Exception as e:
+                    errors.append(f"{url} ({lang}): {e}")
+                    st.error(f"Failed: {url} ({lang}): {e}")
+                progress_bar.progress(done_count / total_jobs)
+
+        status.empty()
+        progress_bar.empty()
+
+        if completed_files:
+            st.balloons()
+            file_data = []
+            for f in completed_files:
+                with open(f, "rb") as fh:
+                    file_data.append({"name": f.name, "data": fh.read()})
+            st.session_state["completed_files"] = file_data
+            if local_path:
+                st.session_state["local_path"] = str(local_path)
+        else:
+            st.error("No files were generated. Check the errors above.")
 
 # Show download buttons from session state (persists across reruns)
 if "completed_files" in st.session_state and st.session_state["completed_files"]:
