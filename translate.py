@@ -202,6 +202,35 @@ def scrape_page(url: str) -> dict:
             seen_texts.add(text)
             content_items.append((tag_label, text))
 
+    # Collect all image alt texts so we can skip them if they appear as P text
+    all_alt_texts = {img.get("alt", "").strip() for img in main.find_all("img") if img.get("alt")}
+    alt_text_phrases = ["animation showing", "animation demonstrating", "screenshot of",
+                        "image of", "photo of", "illustration of", "icon of",
+                        "duplicated for seamless loop", "clone of"]
+
+    def _process_card(card_el):
+        """Extract text from card-style links (feature-card, solution-card, etc.)."""
+        for child in card_el.find_all(["h3", "h4", "h5"]):
+            text = child.get_text(strip=True)
+            if text:
+                _add_item(tag_map.get(child.name, "H4"), text)
+        for child in card_el.find_all("p"):
+            text = child.get_text(strip=True)
+            if text and len(text) >= 5 and text not in all_alt_texts:
+                _add_item("P", text)
+
+    def _process_showcase_card(card_el):
+        """Extract flipbook showcase card title + author."""
+        if card_el.get("aria-hidden") == "true":
+            return
+        title_el = card_el.find("p", class_="fb-showcase-card-title")
+        sub_el = card_el.find("p", class_="fb-showcase-card-subtitle")
+        if title_el:
+            title = title_el.get_text(strip=True)
+            subtitle = sub_el.get_text(strip=True) if sub_el else ""
+            combined = f"{title} — {subtitle}" if subtitle else title
+            _add_item("Showcase", combined)
+
     def _process_section(container):
         """Process a section_content div, extracting items in DOM order."""
         for child in container.children:
@@ -240,14 +269,21 @@ def scrape_page(url: str) -> dict:
                         continue
                 _add_item(tag_label, text)
 
-            # CTA buttons / links (skip card-style links — those are handled separately)
+            # CTA buttons / links — also handle card-style links inline
             elif child.name in ("button", "a"):
-                if len(text) >= 100:
-                    continue
                 classes = " ".join(child.get("class", []))
-                # Skip card links — handled by dedicated card extractors
-                if any(c in classes for c in ["feature-card", "solution-card",
-                                               "fb-showcase-card", "showcase-card"]):
+
+                # Feature cards / solution cards
+                if "feature-card" in classes or "solution-card" in classes:
+                    _process_card(child)
+                    continue
+
+                # Flipbook showcase cards
+                if "fb-showcase-card" in classes:
+                    _process_showcase_card(child)
+                    continue
+
+                if len(text) >= 100:
                     continue
                 href = child.get("href", "")
                 is_cta = (
@@ -276,73 +312,63 @@ def scrape_page(url: str) -> dict:
             elif child.name in ("div", "span", "small", "figcaption", "li", "blockquote"):
                 _process_section(child)
 
-    # Collect all image alt texts so we can skip them if they appear as P text
-    all_alt_texts = {img.get("alt", "").strip() for img in main.find_all("img") if img.get("alt")}
+    # Track which elements we've already processed to avoid duplicates
+    processed_elements = set()
 
-    def _process_card(card_el):
-        """Extract text from card-style links (feature-card, solution-card, etc.)."""
-        for child in card_el.find_all(["h3", "h4", "h5"]):
-            text = child.get_text(strip=True)
-            if text:
-                _add_item(tag_map.get(child.name, "H4"), text)
-        for child in card_el.find_all("p"):
-            text = child.get_text(strip=True)
-            if text and len(text) >= 5 and text not in all_alt_texts:
+    def _mark_processed(el):
+        """Mark an element and all its descendants as processed."""
+        processed_elements.add(id(el))
+        for desc in el.descendants:
+            if hasattr(desc, 'name'):
+                processed_elements.add(id(desc))
+
+    # Single DOM-order walk: iterate all descendants of main
+    for element in main.descendants:
+        if id(element) in processed_elements:
+            continue
+
+        # Skip NavigableStrings at the top level (handled inside _process_section)
+        if isinstance(element, NavigableString):
+            continue
+
+        if not hasattr(element, "name") or not element.name:
+            continue
+
+        classes = " ".join(element.get("class", []))
+
+        # section_content divs — process their children
+        if element.name == "div" and "section_content" in classes:
+            _process_section(element)
+            _mark_processed(element)
+
+        # Feature cards
+        elif element.name == "a" and "feature-card" in classes:
+            _process_card(element)
+            _mark_processed(element)
+
+        # Solution cards
+        elif element.name == "a" and "solution-card" in classes:
+            _process_card(element)
+            _mark_processed(element)
+
+        # Flipbook showcase cards
+        elif element.name == "a" and "fb-showcase-card" in classes:
+            _process_showcase_card(element)
+            _mark_processed(element)
+
+        # Section description paragraphs outside section_content
+        elif element.name == "p" and "section-description" in classes:
+            text = element.get_text(strip=True)
+            if text and len(text) >= 10:
                 _add_item("P", text)
+            _mark_processed(element)
 
-    # First pass: walk all section_content divs in DOM order
-    for section in main.find_all("div", class_=re.compile(r"section_content")):
-        _process_section(section)
-
-    # Second pass: handle special elements not inside section_content divs
-
-    # Font tags used as headings (e.g., <font class="h2">)
-    for font in main.find_all("font"):
-        classes = " ".join(font.get("class", []))
-        text = font.get_text(strip=True)
-        if not text:
-            continue
-        for tag_name, label in [("h1", "H1"), ("h2", "H2"), ("h3", "H3"), ("h4", "H4")]:
-            if tag_name in classes:
-                _add_item(label, text)
-                break
-
-    # Feature cards (<a class="feature-card">)
-    for card in main.find_all("a", class_="feature-card"):
-        _process_card(card)
-
-    # Solution cards (<a class="solution-card">)
-    for card in main.find_all("a", class_="solution-card"):
-        _process_card(card)
-
-    # Flipbook showcase cards (<a class="fb-showcase-card">) — skip aria-hidden duplicates
-    for card in main.find_all("a", class_="fb-showcase-card"):
-        if card.get("aria-hidden") == "true":
-            continue
-        title_el = card.find("p", class_="fb-showcase-card-title")
-        sub_el = card.find("p", class_="fb-showcase-card-subtitle")
-        if title_el:
-            title = title_el.get_text(strip=True)
-            subtitle = sub_el.get_text(strip=True) if sub_el else ""
-            combined = f"{title} — {subtitle}" if subtitle else title
-            _add_item("Showcase", combined)
-
-    # Section description paragraphs (class="section-description") outside section_content
-    for p in main.find_all("p", class_="section-description"):
-        text = p.get_text(strip=True)
-        if text and len(text) >= 10:
-            _add_item("P", text)
-
-    # Filter out any content items that match image alt text (alt text confusion)
+    # Filter out alt text that leaked into content
     content_items_filtered = []
     for tag, text in content_items:
         if tag == "P" and text in all_alt_texts:
             continue
-        # Also skip P tags that look like alt text descriptions (contain "animation showing", "image of", etc.)
-        if tag == "P" and any(phrase in text.lower() for phrase in
-                              ["animation showing", "animation demonstrating", "screenshot of",
-                               "image of", "photo of", "illustration of", "icon of",
-                               "duplicated for seamless loop", "clone of"]):
+        if tag == "P" and any(phrase in text.lower() for phrase in alt_text_phrases):
             continue
         content_items_filtered.append((tag, text))
     content_items.clear()
