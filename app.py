@@ -275,8 +275,8 @@ if st.button("Start Translation", disabled=not can_run, type="primary"):
         errors = []
         done_count = 0
 
-        # Run translations in parallel threads
-        max_workers = min(len(target_langs), 4)  # Cap at 4 parallel languages
+        # Run all (page × language) jobs in parallel, capped to avoid rate limits
+        max_workers = min(total_jobs, 8)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for url, lang in jobs:
