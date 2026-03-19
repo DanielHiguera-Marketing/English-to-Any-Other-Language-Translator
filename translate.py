@@ -553,14 +553,16 @@ def discover_urls(subpath: str = None, crawl_all: bool = False) -> list:
 # Claude API Translation Pipeline
 # ---------------------------------------------------------------------------
 def call_claude(client: anthropic.Anthropic, system: str, user_msg: str) -> str:
-    """Make a single Claude API call and return the response text."""
-    response = client.messages.create(
+    """Make a single Claude API call and return the response text.
+    Uses streaming to avoid the 10-minute timeout on long requests.
+    """
+    with client.messages.stream(
         model=MODEL,
         max_tokens=64000,
         system=system,
         messages=[{"role": "user", "content": user_msg}],
-    )
-    return response.content[0].text
+    ) as stream:
+        return stream.get_final_text()
 
 
 def get_system_prompts(lang: str) -> dict:
