@@ -358,6 +358,11 @@ def scrape_page(url: str) -> dict:
                     if text_li and len(text_li) >= 3:
                         _add_item("Li", text_li)
 
+            # Inline formatting tags — add text to buffer
+            elif name in ("strong", "b", "em", "i"):
+                if text:
+                    _buf.append(text)
+
             # Block containers — flush buffer and recurse
             elif name in ("div", "span", "small", "figcaption", "li", "blockquote"):
                 _flush()
@@ -534,7 +539,7 @@ def call_claude(client: anthropic.Anthropic, system: str, user_msg: str) -> str:
     """Make a single Claude API call and return the response text."""
     response = client.messages.create(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=8192,
         system=system,
         messages=[{"role": "user", "content": user_msg}],
     )
