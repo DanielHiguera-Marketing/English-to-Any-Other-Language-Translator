@@ -126,8 +126,25 @@ def derive_page_name(url: str, soup: BeautifulSoup) -> str:
 def scrape_page(url: str) -> dict:
     """Scrape a Paperturn page and return structured content."""
     print(f"  Scraping {url} ...")
-    resp = requests.get(url, timeout=30, headers={"User-Agent": "PaperturnTranslator/1.0"})
+    resp = requests.get(url, timeout=30, headers={
+        "User-Agent": "PaperturnTranslator/1.0",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
     resp.raise_for_status()
+
+    # Detect geo-redirects: if the server redirected to a language-specific path
+    # (e.g. /da/, /de/, /fr/) the content will be in that language, not English.
+    if resp.history:
+        final_path = urlparse(resp.url).path
+        if re.match(r'^/[a-z]{2}(/|$)', final_path):
+            lang_code = final_path.split('/')[1]
+            raise ValueError(
+                f"This URL was geo-redirected to the '{lang_code}' localised version "
+                f"({resp.url}). The scraper received {lang_code.upper()} content instead "
+                f"of English. To fix this, either:\n"
+                f"  • Use a VPN set to a non-{lang_code.upper()} country, or\n"
+                f"  • Provide the direct English page URL (e.g. paperturn.com/pamphlet-maker)"
+            )
     soup = BeautifulSoup(resp.text, "lxml")
 
     # --- Page metadata ---
