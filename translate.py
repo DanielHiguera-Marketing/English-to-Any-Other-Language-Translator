@@ -539,7 +539,7 @@ def call_claude(client: anthropic.Anthropic, system: str, user_msg: str) -> str:
     """Make a single Claude API call and return the response text."""
     response = client.messages.create(
         model=MODEL,
-        max_tokens=8192,
+        max_tokens=64000,
         system=system,
         messages=[{"role": "user", "content": user_msg}],
     )
