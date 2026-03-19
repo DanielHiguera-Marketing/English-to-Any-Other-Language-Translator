@@ -209,7 +209,10 @@ def scrape_page(url: str) -> dict:
                         "duplicated for seamless loop", "clone of"]
 
     def _process_card(card_el):
-        """Extract text from card-style links (feature-card, solution-card, etc.)."""
+        """Extract text from card-style links (feature-card, solution-card, etc.).
+        Cards may share identical P text (CMS placeholder), so we skip global
+        deduplication and append directly.
+        """
         for child in card_el.find_all(["h3", "h4", "h5"]):
             text = child.get_text(strip=True)
             if text:
@@ -217,7 +220,7 @@ def scrape_page(url: str) -> dict:
         for child in card_el.find_all("p"):
             text = child.get_text(strip=True)
             if text and len(text) >= 5 and text not in all_alt_texts:
-                _add_item("P", text)
+                content_items.append(("P", text))
 
     def _process_showcase_card(card_el):
         """Extract flipbook showcase card title + author."""
@@ -232,36 +235,53 @@ def scrape_page(url: str) -> dict:
             _add_item("Showcase", combined)
 
     def _process_section(container):
-        """Process a section_content div, extracting items in DOM order."""
+        """Process a section_content div, extracting items in DOM order.
+
+        Uses an inline buffer so that bare text nodes and inline elements
+        (font tags without a heading class, inline <a> links) are accumulated
+        and flushed as a single P rather than creating fragmented entries.
+        """
+        _buf = []  # accumulates inline text fragments
+
+        def _flush():
+            if not _buf:
+                return
+            text = re.sub(r'\s+', ' ', " ".join(_buf)).strip()
+            _buf.clear()
+            if not text or len(text) < 5:
+                return
+            if text in seen_texts:
+                return
+            if _is_trust_signal(text):
+                _add_item("Trust Signal", text)
+            elif _is_testimonial_attribution(text):
+                _add_item("Attribution", text)
+            elif len(text) >= 15:
+                _add_item("P", text)
+
         for child in container.children:
-            # Bare text nodes (descriptions after H3s, attributions, trust signals)
+            # Bare text nodes → buffer
             if isinstance(child, NavigableString):
-                text = child.strip()
-                if not text or len(text) < 5:
-                    continue
-                if text in seen_texts:
-                    continue
-                if _is_trust_signal(text):
-                    _add_item("Trust Signal", text)
-                elif _is_testimonial_attribution(text):
-                    _add_item("Attribution", text)
-                elif len(text) >= 15:
-                    _add_item("P", text)
+                t = child.strip()
+                if t:
+                    _buf.append(t)
                 continue
 
             if not hasattr(child, "name") or not child.name:
                 continue
 
+            name = child.name
             text = child.get_text(strip=True)
-            if not text or len(text) <= 1:
-                continue
 
-            # Headings and paragraphs
-            if child.name in tag_map:
-                tag_label = tag_map[child.name]
+            # Headings and block paragraphs — flush buffer first
+            if name in tag_map:
+                _flush()
+                tag_label = tag_map[name]
+                if not text or len(text) <= 1:
+                    continue
                 if tag_label == "P" and len(text) < 5:
                     continue
-                # Skip P tags that only contain CTA links
+                # Skip P tags whose entire text content comes from child links
                 if tag_label == "P":
                     child_links = child.find_all("a")
                     link_text = "".join(a.get_text(strip=True) for a in child_links)
@@ -269,48 +289,82 @@ def scrape_page(url: str) -> dict:
                         continue
                 _add_item(tag_label, text)
 
-            # CTA buttons / links — also handle card-style links inline
-            elif child.name in ("button", "a"):
+            # Buttons (always a standalone CTA)
+            elif name == "button":
+                _flush()
+                if text and len(text) < 100:
+                    _add_item("CTA Button", text)
+
+            # Anchor tags — distinguish inline links from standalone CTAs
+            elif name == "a":
                 classes = " ".join(child.get("class", []))
 
-                # Feature cards / solution cards
+                # Cards → flush buffer and process as card
                 if "feature-card" in classes or "solution-card" in classes:
+                    _flush()
                     _process_card(child)
                     continue
-
-                # Flipbook showcase cards
                 if "fb-showcase-card" in classes:
+                    _flush()
                     _process_showcase_card(child)
                     continue
 
-                if len(text) >= 100:
+                if not text or len(text) >= 100:
                     continue
+
                 href = child.get("href", "")
-                is_cta = (
-                    child.name == "button"
-                    or "btn" in classes.lower()
-                    or "cta" in classes.lower()
-                    or any(kw in text.lower() for kw in cta_keywords)
+                # "Explicit" CTAs have a btn/cta CSS class — always standalone
+                is_explicit_cta = "btn" in classes.lower() or "cta" in classes.lower()
+                # "Keyword" CTAs match text/href patterns but may be inline links
+                is_keyword_cta = (
+                    any(kw in text.lower() for kw in cta_keywords)
                     or any(kw in href.lower() for kw in cta_hrefs)
                 )
-                if is_cta:
+
+                if is_explicit_cta or (is_keyword_cta and not _buf):
+                    # Standalone CTA: flush any buffered text, then add as CTA
+                    _flush()
                     _add_item("CTA Button", text)
+                else:
+                    # Inline link surrounded by text — add link text to buffer
+                    _buf.append(text)
 
             # Font tags used as headings (CMS pattern: <font class="h2">)
-            elif child.name == "font":
+            # or CTA buttons (CMS pattern: <font class="btnAction2">)
+            # Font tags without a heading/btn class are treated as inline text
+            elif name == "font":
                 classes = " ".join(child.get("class", []))
-                handled = False
+                is_heading = False
                 for tag_name, label in [("h1", "H1"), ("h2", "H2"), ("h3", "H3"), ("h4", "H4")]:
                     if tag_name in classes:
+                        _flush()
                         _add_item(label, text)
-                        handled = True
+                        is_heading = True
                         break
-                if not handled:
-                    _process_section(child)
+                if not is_heading:
+                    if "btn" in classes.lower() and text:
+                        # CTA button font (e.g. btnAction2, btnAction2StrokeWhite)
+                        _flush()
+                        _add_item("CTA Button", text)
+                    elif text:
+                        # Plain <font> tag (e.g. <font>logos</font>) — inline
+                        _buf.append(text)
 
-            # Nested div or span — recurse for bare text inside
-            elif child.name in ("div", "span", "small", "figcaption", "li", "blockquote"):
+            # List containers — flush buffer, then extract list items
+            elif name in ("ul", "ol"):
+                _flush()
+                for li in child.find_all("li", recursive=False):
+                    text_li = li.get_text(strip=True)
+                    if text_li and len(text_li) >= 3:
+                        _add_item("Li", text_li)
+
+            # Block containers — flush buffer and recurse
+            elif name in ("div", "span", "small", "figcaption", "li", "blockquote"):
+                _flush()
                 _process_section(child)
+
+        # Flush any remaining buffered text at end of container
+        _flush()
 
     # Track which elements we've already processed to avoid duplicates
     processed_elements = set()
