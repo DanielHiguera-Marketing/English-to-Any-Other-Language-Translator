@@ -300,7 +300,7 @@ def scrape_page(url: str) -> dict:
                 classes = " ".join(child.get("class", []))
 
                 # Cards → flush buffer and process as card
-                if "feature-card" in classes or "solution-card" in classes:
+                if "feature-card" in classes or "features-row-card" in classes or "solution-card" in classes:
                     _flush()
                     _process_card(child)
                     continue
@@ -396,7 +396,7 @@ def scrape_page(url: str) -> dict:
             _mark_processed(element)
 
         # Feature cards
-        elif element.name == "a" and "feature-card" in classes:
+        elif element.name == "a" and ("feature-card" in classes or "features-row-card" in classes):
             _process_card(element)
             _mark_processed(element)
 
