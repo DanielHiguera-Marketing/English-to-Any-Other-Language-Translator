@@ -203,16 +203,12 @@ def process_page_lang(url, lang, page_data, api_key, semrush_key_val,
         )
 
     # Content
-    try:
-        content_translations = translate_content(
-            client, page_data["content"],
-            prompts["translator"], prompts["copywriter"],
-            lang, char_limit_pct=char_limit_pct_val,
-            seo_keywords=semrush_keywords if semrush_keywords else None,
-        )
-    except Exception as e:
-        print(f"  Content translation failed ({lang}): {e}")
-        content_translations = ([], [], [])
+    content_translations = translate_content(
+        client, page_data["content"],
+        prompts["translator"], prompts["copywriter"],
+        lang, char_limit_pct=char_limit_pct_val,
+        seo_keywords=semrush_keywords if semrush_keywords else None,
+    )
 
     # Images
     try:
